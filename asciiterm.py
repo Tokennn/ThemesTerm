@@ -1,35 +1,32 @@
 #!/usr/bin/env python3
 """Ton shell par-dessus un fond ASCII animé, ligne de saisie en jaune.
 
-Le shell tourne dans un pseudo-terminal ; pyte décode ce qu'il affiche et on
-le dessine par-dessus l'animation d'asciiwall.
+Le shell tourne dans un pseudo-terminal (pty sous macOS/Linux, ConPTY via pywinpty
+sous Windows) ; pyte décode ce qu'il affiche et on le dessine par-dessus l'animation
+d'asciiwall.
 
 Changer de fond :
   fond            menu (↑/↓, Entrée, Échap), aperçu en direct
   fond koi        par nom (même partiel), fond 3 par numéro, fond hasard
   Ctrl+]          fond suivant
+La fonction shell `fond` dépose sa demande dans le dossier $ASCIITERM et y lit la réponse.
 Le choix est mémorisé dans ~/.config/asciiwall/theme.
-Quitter : `exit` ou Ctrl+D dans le shell.
-Nécessite pyte : .venv/bin/pip install pyte
+Quitter : `exit` dans le shell.
 """
-import fcntl
 import os
-import pty
+import queue
 import random
-import re
-import select
 import shutil
-import signal
-import struct
 import sys
-import termios
+import tempfile
+import threading
 import time
-import tty
 
 import pyte
 
 import asciiwall as aw
 
+WINDOWS = os.name == "nt"
 FPS = 25
 YELLOW = (255, 214, 10)
 DEFAULT_FG = (235, 235, 235)
@@ -44,8 +41,6 @@ PALETTE.update({"bright" + k: aw.shade(v, 1.2) for k, v in list(PALETTE.items())
 CONFIG = os.path.expanduser("~/.config/asciiwall/theme")
 CHOICES = aw.NAMES + ["Au hasard"]
 RANDOM = len(aw.NAMES)  # index de « Au hasard » dans CHOICES
-# Séquence envoyée par la fonction shell `fond` : ESC ] 7777 ; argument BEL
-FOND_CMD = re.compile(rb"\x1b\]7777;([^\x07]*)\x07")
 UP = (b"\x1b[A", b"\x1bOA", b"\x1b[D", b"\x1bOD")
 DOWN = (b"\x1b[B", b"\x1bOB", b"\x1b[C", b"\x1bOC")
 
@@ -79,10 +74,120 @@ def match_choice(arg):
     return None
 
 
-class Wall:
-    """Fond affiché, menu de choix et mémorisation du choix."""
+# ---------------------------------------------------------------- shell et clavier
 
-    def __init__(self):
+class UnixShell:
+    def __init__(self, rows, cols, env):
+        import pty
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            os.environ.clear()
+            os.environ.update(env)
+            shell = env.get("SHELL", "/bin/zsh")
+            os.execvp(shell, [shell, "-i"])
+        self.resize(rows, cols)
+
+    def read(self):
+        return os.read(self.fd, 65536)  # OSError quand le shell s'est terminé
+
+    def write(self, data):
+        os.write(self.fd, data)
+
+    def resize(self, rows, cols):
+        import fcntl
+        import struct
+        import termios
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def close(self):
+        import signal
+        try:
+            os.kill(self.pid, signal.SIGHUP)  # au cas où on sort sur une erreur
+        except ProcessLookupError:
+            pass
+        os.waitpid(self.pid, 0)
+
+
+class WindowsShell:
+    def __init__(self, rows, cols, env):
+        from winpty import PtyProcess
+        shell = shutil.which("pwsh") or "powershell.exe"  # PowerShell 7 si installé
+        self.proc = PtyProcess.spawn([shell, "-NoLogo"], dimensions=(rows, cols), env=env)
+
+    def read(self):
+        try:
+            return self.proc.read(65536).encode()
+        except EOFError:
+            return b""
+
+    def write(self, data):
+        self.proc.write(data.decode(errors="replace"))
+
+    def resize(self, rows, cols):
+        self.proc.setwinsize(rows, cols)
+
+    def close(self):
+        if self.proc.isalive():
+            self.proc.terminate(force=True)
+
+
+class UnixConsole:
+    """Clavier en mode brut : chaque touche arrive telle quelle (flèches = séquences ESC)."""
+
+    def __enter__(self):
+        import termios
+        import tty
+        self.saved = termios.tcgetattr(0)
+        tty.setraw(0)
+        return self
+
+    def read(self):
+        return os.read(0, 4096)
+
+    def __exit__(self, *exc):
+        import termios
+        termios.tcsetattr(0, termios.TCSADRAIN, self.saved)
+
+
+class WindowsConsole:
+    """Console Windows en mode « terminal virtuel » : mêmes séquences ESC que sous Unix."""
+
+    def __enter__(self):
+        import ctypes
+        self.k32 = ctypes.windll.kernel32
+        self.hin, self.hout = self.k32.GetStdHandle(-10), self.k32.GetStdHandle(-11)
+        self.modes = []
+        for handle in (self.hin, self.hout):
+            mode = ctypes.c_uint32()
+            self.k32.GetConsoleMode(handle, ctypes.byref(mode))
+            self.modes.append(mode.value)
+        # Entrée : sans écho ni ligne ni Ctrl+C, + ENABLE_VIRTUAL_TERMINAL_INPUT
+        self.k32.SetConsoleMode(self.hin, (self.modes[0] & ~0x7) | 0x200)
+        # Sortie : ENABLE_PROCESSED_OUTPUT + ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        self.k32.SetConsoleMode(self.hout, self.modes[1] | 0x1 | 0x4)
+        self.cp = self.k32.GetConsoleOutputCP(), self.k32.GetConsoleCP()
+        self.k32.SetConsoleOutputCP(65001)
+        self.k32.SetConsoleCP(65001)
+        sys.stdout.reconfigure(encoding="utf-8")
+        return self
+
+    def read(self):
+        return os.read(0, 4096)
+
+    def __exit__(self, *exc):
+        self.k32.SetConsoleMode(self.hin, self.modes[0])
+        self.k32.SetConsoleMode(self.hout, self.modes[1])
+        self.k32.SetConsoleOutputCP(self.cp[0])
+        self.k32.SetConsoleCP(self.cp[1])
+
+
+# ---------------------------------------------------------------- fond et menu
+
+class Wall:
+    """Fond affiché, menu de choix, demandes de la commande `fond`, mémorisation."""
+
+    def __init__(self, ctl):
+        self.ctl = ctl  # dossier d'échange avec la fonction shell `fond`
         try:
             choice = match_choice(open(CONFIG).read())
         except OSError:
@@ -105,19 +210,34 @@ class Wall:
         except OSError:
             pass
 
-    def command(self, m):
-        # Appelé pour chaque `fond …` vu dans la sortie du shell ; renvoie le texte à afficher.
-        arg = m.group(1).decode(errors="replace")
+    def command(self, arg):
+        # Traite `fond …` ; renvoie le texte que la fonction shell doit afficher.
         if not arg.strip():
             self.picker, self.before = self.idx, self.idx
-            return b""
+            return ""
         choice = match_choice(arg)
         if choice is None:
             names = ", ".join(n.split()[0].lower() for n in aw.NAMES) + ", hasard"
-            return ("fond : « %s » inconnu. Essaie : fond, fond 1-%d, ou %s\r\n"
-                    % (arg, len(CHOICES), names)).encode()
+            return ("fond : « %s » inconnu. Essaie : fond, fond 1-%d, ou %s\n"
+                    % (arg.strip(), len(CHOICES), names))
         self.apply(choice)
-        return b""
+        return ""
+
+    def poll(self):
+        # La fonction shell écrit cmd (via cmd.tmp + renommage) puis attend reply.
+        path = os.path.join(self.ctl, "cmd")
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                arg = f.read()
+            os.remove(path)
+        except OSError:
+            return
+        tmp = os.path.join(self.ctl, "reply.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(self.command(arg))
+        os.replace(tmp, os.path.join(self.ctl, "reply"))
 
     def key(self, data):
         # Touches pendant que le menu est ouvert (elles ne vont pas au shell).
@@ -165,18 +285,16 @@ class Wall:
         put(x0, y + 1, "╰" + "─" * (bw - 2) + "╯", border, panel)
 
 
+# ---------------------------------------------------------------- rendu
+
 class Screen(pyte.Screen):
-    def __init__(self, cols, rows, fd):
+    def __init__(self, cols, rows, shell):
         super().__init__(cols, rows)
-        self.fd = fd
+        self.shell = shell
 
     def write_process_input(self, data):
         # Réponses aux questions du shell (position du curseur, type de terminal…)
-        os.write(self.fd, data.encode())
-
-
-def set_size(fd, rows, cols):
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        self.shell.write(data.encode())
 
 
 def compose(theme, screen, w, h, t):
@@ -221,71 +339,82 @@ def encode(buf, prev):
     return "".join(out)
 
 
+def term_size():
+    # os.get_terminal_size plutôt que shutil : ignore COLUMNS/LINES éventuellement figés
+    try:
+        return tuple(os.get_terminal_size(sys.stdout.fileno()))
+    except OSError:
+        return 100, 30
+
+
+def pump(events, tag, read):
+    # Lit en boucle (shell ou clavier) dans un thread et poste dans la file d'événements.
+    while True:
+        try:
+            data = read()
+        except (OSError, EOFError):
+            data = b""
+        events.put((tag, data))
+        if not data:
+            return
+
+
 def main():
     if not sys.stdin.isatty():
         sys.exit("asciiterm doit être lancé dans un terminal")
-    cols, rows = shutil.get_terminal_size()
+    cols, rows = term_size()
+    ctl = tempfile.mkdtemp(prefix="asciiwall-")
+    env = dict(os.environ, ASCIITERM=ctl)
+    env.pop("ASCIIWALL", None)  # pas de relance dans le shell interne
 
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.environ.pop("ASCIIWALL", None)  # pas de relance dans le shell interne
-        os.environ["ASCIITERM"] = "1"
-        shell = os.environ.get("SHELL", "/bin/zsh")
-        os.execvp(shell, [shell, "-i"])
-
-    set_size(fd, rows, cols)
-    screen = Screen(cols, rows, fd)
+    shell = (WindowsShell if WINDOWS else UnixShell)(rows, cols, env)
+    screen = Screen(cols, rows, shell)
     stream = pyte.ByteStream(screen)
-    resized = [False]
-    signal.signal(signal.SIGWINCH, lambda *_: resized.__setitem__(0, True))
+    wall, t0, prev, next_frame = Wall(ctl), time.time(), None, 0.0
+    events = queue.Queue()
 
-    wall, t0, prev, next_frame = Wall(), time.time(), None, 0.0
-    saved = termios.tcgetattr(0)
-    tty.setraw(0)
-    sys.stdout.write("\x1b[?1049h\x1b[?25l")
-    try:
-        while True:
-            r, _, _ = select.select([0, fd], [], [], max(0, next_frame - time.time()))
-            if 0 in r:
-                data = os.read(0, 4096)
-                if wall.picker is not None:
-                    wall.key(data)
-                    data = b""
-                if b"\x1d" in data:  # Ctrl+]
-                    wall.apply((wall.idx + 1) % len(aw.THEMES))
-                    data = data.replace(b"\x1d", b"")
-                if data:
-                    os.write(fd, data)
-            if fd in r:
-                try:
-                    data = os.read(fd, 65536)
-                except OSError:  # le shell s'est terminé
-                    break
-                if not data:
-                    break
-                stream.feed(FOND_CMD.sub(wall.command, data))
-            if resized[0]:
-                resized[0] = False
-                cols, rows = shutil.get_terminal_size()
-                screen.resize(rows, cols)
-                set_size(fd, rows, cols)
-                prev = None
-            if time.time() >= next_frame:
-                buf = compose(wall.theme, screen, cols, rows, time.time() - t0)
-                if wall.picker is not None:
-                    wall.draw_picker(buf, cols, rows)
-                sys.stdout.write(encode(buf, prev))
-                sys.stdout.flush()
-                prev, next_frame = buf, time.time() + 1 / FPS
-    finally:
-        sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
-        sys.stdout.flush()
-        termios.tcsetattr(0, termios.TCSADRAIN, saved)
+    with (WindowsConsole if WINDOWS else UnixConsole)() as console:
+        sys.stdout.write("\x1b[?1049h\x1b[?25l")  # écran alternatif + curseur caché
+        threading.Thread(target=pump, args=(events, "shell", shell.read), daemon=True).start()
+        threading.Thread(target=pump, args=(events, "key", console.read), daemon=True).start()
         try:
-            os.kill(pid, signal.SIGHUP)  # au cas où on sort sur une erreur
-        except ProcessLookupError:
-            pass
-        os.waitpid(pid, 0)
+            while True:
+                try:
+                    tag, data = events.get(timeout=max(0, next_frame - time.time()))
+                except queue.Empty:
+                    tag = None
+                if tag == "shell":
+                    if not data:  # le shell s'est terminé
+                        break
+                    stream.feed(data)
+                elif tag == "key" and data:
+                    if wall.picker is not None:
+                        wall.key(data)
+                        data = b""
+                    if b"\x1d" in data:  # Ctrl+]
+                        wall.apply((wall.idx + 1) % len(aw.THEMES))
+                        data = data.replace(b"\x1d", b"")
+                    if data:
+                        shell.write(data)
+                wall.poll()
+                size = term_size()
+                if size != (cols, rows):
+                    cols, rows = size
+                    screen.resize(rows, cols)
+                    shell.resize(rows, cols)
+                    prev = None
+                if time.time() >= next_frame:
+                    buf = compose(wall.theme, screen, cols, rows, time.time() - t0)
+                    if wall.picker is not None:
+                        wall.draw_picker(buf, cols, rows)
+                    sys.stdout.write(encode(buf, prev))
+                    sys.stdout.flush()
+                    prev, next_frame = buf, time.time() + 1 / FPS
+        finally:
+            sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
+            sys.stdout.flush()
+            shell.close()
+            shutil.rmtree(ctl, ignore_errors=True)
 
 
 if __name__ == "__main__":

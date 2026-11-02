@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Installe ThemeTerm : fond ASCII animé dans le terminal de Cursor (macOS / Linux).
+# Installe ThemeTerm : fond ASCII animé dans le terminal de Cursor (macOS / Linux / WSL).
+# Windows sans WSL : utiliser install.cmd.
 # Relançable sans risque : il remplace sa propre configuration au lieu de la dupliquer.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -11,7 +12,10 @@ if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import sys; sys.exit(sy
 fi
 
 echo "→ Environnement Python (.venv) et dépendance pyte"
-python3 -m venv .venv
+if ! python3 -m venv .venv; then
+  echo "Création de .venv impossible. Sur Ubuntu / WSL : sudo apt install python3-venv"
+  exit 1
+fi
 .venv/bin/pip install -q --disable-pip-version-check -r requirements.txt
 
 echo "→ Configuration du shell et de Cursor"

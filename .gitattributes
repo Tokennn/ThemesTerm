@@ -1,0 +1,4 @@
+# Scripts Windows en CRLF, tout le reste en LF (sinon bash dans WSL échoue)
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

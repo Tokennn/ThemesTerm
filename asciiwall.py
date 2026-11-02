@@ -314,18 +314,33 @@ def to_ansi(buf):
     return "".join(out)
 
 
+def key_reader():
+    # Renvoie (lire, restaurer) : lire() donne la touche pressée ou "" sans bloquer.
+    if os.name == "nt":
+        import msvcrt
+        os.system("")  # active les séquences de couleur ANSI dans la console Windows
+        sys.stdout.reconfigure(encoding="utf-8")
+        if not sys.stdin.isatty():
+            return (lambda: ""), (lambda: None)
+        return (lambda: msvcrt.getwch() if msvcrt.kbhit() else ""), (lambda: None)
+    if not sys.stdin.isatty():
+        return (lambda: ""), (lambda: None)
+    import termios
+    import tty
+    saved = termios.tcgetattr(sys.stdin)
+    tty.setcbreak(sys.stdin)
+    return ((lambda: sys.stdin.read(1) if select.select([sys.stdin], [], [], 0)[0] else ""),
+            (lambda: termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)))
+
+
 def main():
     frames = int(sys.argv[sys.argv.index("--frames") + 1]) if "--frames" in sys.argv else None
     splash = float(sys.argv[sys.argv.index("--splash") + 1]) if "--splash" in sys.argv else None
-    interactive = sys.stdin.isatty()
     idx = random.randrange(len(THEMES)) if splash else 0
     theme, old, switch_t = THEMES[idx](), None, 0.0
     t0, n = time.time(), 0
 
-    if interactive:
-        import termios, tty
-        saved = termios.tcgetattr(sys.stdin)
-        tty.setcbreak(sys.stdin)
+    read_key, restore = key_reader()
     sys.stdout.write("\x1b[?1049h\x1b[?25l")  # écran alternatif + curseur caché
     try:
         while frames is None or n < frames:
@@ -333,8 +348,8 @@ def main():
             w, h = shutil.get_terminal_size((100, 30))
             if splash and t > splash:
                 break
-            if interactive and select.select([sys.stdin], [], [], 0)[0]:
-                key = sys.stdin.read(1)
+            key = read_key()
+            if key:
                 if key == "q" or splash:
                     break
                 if key == "n" or key in "12345678"[:len(THEMES)]:
@@ -365,8 +380,7 @@ def main():
         pass
     finally:
         sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
-        if interactive:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
+        restore()
 
 
 if __name__ == "__main__":
