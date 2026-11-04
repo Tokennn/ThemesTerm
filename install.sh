@@ -7,13 +7,16 @@ cd "$(dirname "$0")"
 
 if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))'; then
   echo "Python 3.8 ou plus est nécessaire."
-  echo "Sur Mac : xcode-select --install   (ou : brew install python)"
+  echo "Sur Mac            : xcode-select --install   (ou : brew install python)"
+  echo "Ubuntu / Debian/WSL: sudo apt install python3 python3-venv"
+  echo "Fedora             : sudo dnf install python3"
+  echo "Arch               : sudo pacman -S python"
   exit 1
 fi
 
 echo "→ Environnement Python (.venv) et dépendance pyte"
 if ! python3 -m venv .venv; then
-  echo "Création de .venv impossible. Sur Ubuntu / WSL : sudo apt install python3-venv"
+  echo "Création de .venv impossible. Sur Ubuntu / Debian / WSL : sudo apt install python3-venv"
   exit 1
 fi
 .venv/bin/pip install -q --disable-pip-version-check -r requirements.txt
@@ -22,5 +25,6 @@ echo "→ Configuration du shell et de Cursor"
 .venv/bin/python configure.py install
 
 echo
-echo "✓ Installé. Ouvre un nouveau terminal dans Cursor."
+echo "✓ Installé. Ouvre un nouveau terminal (n'importe lequel) : choisis"
+echo "  « Terminal classique » ou « ThemesTerm » (hello + fond animé)."
 echo "  Changer de fond : fond   (ou fond koi, fond 3, fond hasard)"

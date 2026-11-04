@@ -15,24 +15,28 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.expanduser("~/.config/asciiwall")
+FISH_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or "~/.config", "fish", "conf.d", "asciiwall.fish")
 START, END = "# >>> asciiwall >>>", "# <<< asciiwall <<<"
 WINDOWS = os.name == "nt"
 WSL = not WINDOWS and "microsoft" in platform.release().lower()
 
 UNIX_BLOCK = START + r'''
-# Terminal de Cursor : le shell tourne par-dessus un fond ASCII animé (ASCIIWALL est
-# défini dans les réglages Cursor). Placé en tout début pour ne pas charger ce fichier
-# deux fois. Si le script échoue, on continue avec un shell normal.
-if [[ "$ASCIIWALL" == 1 && $- == *i* && -t 0 && -t 1 ]]; then
-  unset ASCIIWALL
-  "@DIR@/.venv/bin/python" "@DIR@/asciiterm.py" && exit
+# À l'ouverture de n'importe quel terminal (une fois par fenêtre/onglet) : écran de choix
+# entre le terminal classique et ThemesTerm (hello + fond animé). Placé en tout début pour
+# ne pas charger ce fichier deux fois. Code 0 = session ThemesTerm terminée -> on ferme ;
+# 3 = terminal classique ; autre (erreur) -> on continue avec un shell normal.
+# Désactiver dans une appli : variable ASCIIWALL=0 ; réglages : ~/.config/asciiwall/launcher
+if [[ $- == *i* && -t 0 && -t 1 && -z $ASCIITERM && "$TERM" != dumb && "$ASCIIWALL" != 0 &&
+      "$ASCIIWALL_TTY" != "$(tty)" ]]; then
+  export ASCIIWALL_TTY="$(tty)"
+  "@DIR@/.venv/bin/python" "@DIR@/themesterm.py"
+  [[ $? == 0 ]] && exit
 fi
-unset ASCIIWALL
 
 # Changer le fond animé : `fond` (menu), `fond koi`, `fond 3`, `fond hasard`
 fond() {
   if [[ -z $ASCIITERM ]]; then
-    echo "fond : disponible seulement dans un terminal Cursor avec fond animé" >&2
+    echo "fond : disponible seulement dans une session ThemesTerm" >&2
     return 1
   fi
   rm -f "$ASCIITERM/reply"
@@ -82,6 +86,35 @@ function fond {
 ''' + END + "\n"
 
 
+FISH_BLOCK = START + r"""
+# Même chose que le bloc bash/zsh, en syntaxe fish (fichier conf.d, retiré à la désinstallation).
+# Code 0 = session ThemesTerm terminée -> exec true ferme le terminal (exit ne quitte pas
+# fish depuis un fichier de configuration).
+if status is-interactive; and test -t 0; and test -t 1; and test -z "$ASCIITERM"
+    and test "$TERM" != dumb; and test "$ASCIIWALL" != 0; and test "$ASCIIWALL_TTY" != (tty)
+    set -gx ASCIIWALL_TTY (tty)
+    "@DIR@/.venv/bin/python" "@DIR@/themesterm.py"
+    test $status -eq 0; and exec true
+end
+
+# Changer le fond animé : `fond` (menu), `fond koi`, `fond 3`, `fond hasard`
+function fond
+    if test -z "$ASCIITERM"
+        echo "fond : disponible seulement dans une session ThemesTerm" >&2
+        return 1
+    end
+    rm -f "$ASCIITERM/reply"
+    printf '%s' "$argv" > "$ASCIITERM/cmd.tmp"; and mv -f "$ASCIITERM/cmd.tmp" "$ASCIITERM/cmd"
+    for i in (seq 20)
+        if test -f "$ASCIITERM/reply"
+            cat "$ASCIITERM/reply"; rm -f "$ASCIITERM/reply"; return 0
+        end
+        sleep 0.05
+    end
+end
+""" + END + "\n"
+
+
 # ---------------------------------------------------------------- où écrire
 
 def windows_documents():
@@ -100,7 +133,7 @@ def windows_appdata():
     return subprocess.check_output(["wslpath", "-u", out.decode(errors="replace").strip()]).decode().strip()
 
 
-def shell_files():
+def shell_files(install=True):
     """Fichiers de démarrage du shell : [(chemin, bloc, encodage)]."""
     if WINDOWS:
         docs = windows_documents()
@@ -108,30 +141,43 @@ def shell_files():
         # PowerShell 7 et Windows PowerShell 5.1 ont chacun leur profil ; BOM pour 5.1
         return [(os.path.join(docs, d, "Microsoft.PowerShell_profile.ps1"), block, "utf-8-sig")
                 for d in ("PowerShell", "WindowsPowerShell")]
-    shell = os.path.basename(os.environ.get("SHELL", "zsh"))
-    if shell == "bash":
+    unix = UNIX_BLOCK.replace("@DIR@", HERE)
+    bash_rc = "~/.bash_profile" if platform.system() == "Darwin" else "~/.bashrc"
+    files = {
+        "zsh": [("~/.zshrc", unix)],
         # Sur Mac, les terminaux ouvrent un shell de connexion qui lit .bash_profile
-        rc = "~/.bash_profile" if platform.system() == "Darwin" else "~/.bashrc"
-    else:
-        rc = "~/.zshrc"
-    return [(os.path.expanduser(rc), UNIX_BLOCK.replace("@DIR@", HERE), "utf-8")]
+        "bash": [(bash_rc, unix)],
+        "fish": [(FISH_FILE, FISH_BLOCK.replace("@DIR@", HERE))],
+    }
+    if not install:  # on nettoie partout, même si l'utilisateur a changé de shell depuis
+        return [(os.path.expanduser(p), b, "utf-8") for v in files.values() for p, b in v]
+    shell = os.path.basename(os.environ.get("SHELL", ""))
+    if shell not in files:
+        print("! Shell « %s » non pris en charge : l'écran de choix marche avec bash, zsh et fish.\n"
+              "  Lancer ThemesTerm à la main : \"%s/.venv/bin/python\" \"%s/themesterm.py\""
+              % (shell or "inconnu", HERE, HERE))
+        return []
+    return [(os.path.expanduser(p), b, "utf-8") for p, b in files[shell]]
 
 
 def cursor_targets():
-    """Réglages Cursor à modifier : [(settings.json, clé, variables)]."""
+    """Réglages Cursor : [(settings.json, clé, variables)].
+
+    Windows : ASCIIWALL=1 déclenche le fond dans les terminaux PowerShell de Cursor.
+    macOS / Linux / WSL : l'écran de choix s'affiche dans tous les terminaux, Cursor
+    n'a plus besoin de réglage ; ce sont les anciens réglages, à retirer.
+    """
     if platform.system() == "Darwin":
         return [(os.path.expanduser("~/Library/Application Support/Cursor/User/settings.json"),
                  "terminal.integrated.env.osx", {"ASCIIWALL": "1"})]
-    if WINDOWS or WSL:
+    if WINDOWS:
         path = os.path.join(windows_appdata(), "Cursor", "User", "settings.json")
-        targets = [(path, "terminal.integrated.env.windows", {"ASCIIWALL": "1"})]
-        if WSL:
-            # WSLENV transmet ASCIIWALL de Windows au terminal WSL ; env.linux sert
-            # quand Cursor est ouvert « dans » WSL (fenêtre distante)
-            targets = [(path, "terminal.integrated.env.windows",
-                        {"ASCIIWALL": "1", "WSLENV": "ASCIIWALL:${env:WSLENV}"}),
-                       (path, "terminal.integrated.env.linux", {"ASCIIWALL": "1"})]
-        return targets
+        return [(path, "terminal.integrated.env.windows", {"ASCIIWALL": "1"})]
+    if WSL:
+        # ASCIIWALL de env.windows est laissé : il peut servir à l'installation PowerShell
+        path = os.path.join(windows_appdata(), "Cursor", "User", "settings.json")
+        return [(path, "terminal.integrated.env.windows", {"WSLENV": "ASCIIWALL:${env:WSLENV}"}),
+                (path, "terminal.integrated.env.linux", {"ASCIIWALL": "1"})]
     return [(os.path.expanduser("~/.config/Cursor/User/settings.json"),
              "terminal.integrated.env.linux", {"ASCIIWALL": "1"})]
 
@@ -154,15 +200,20 @@ def strip_block(text):
 
 
 def edit_shell(install):
-    for path, block, encoding in shell_files():
+    for path, block, encoding in shell_files(install):
         old = open(path, encoding="utf-8-sig").read() if os.path.exists(path) else ""
         new = strip_block(old)
         if install:
             new = block + "\n" + new
         if new == old:
-            print("✓ %s déjà à jour" % path)
+            if install:
+                print("✓ %s déjà à jour" % path)
             continue
         if not install and not os.path.exists(path):
+            continue
+        if path == os.path.expanduser(FISH_FILE) and not new.strip():
+            os.remove(path)  # fichier créé par nous : on le retire en entier
+            print("✓ %s supprimé" % path)
             continue
         backup(path)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -211,7 +262,7 @@ def main():
         sys.exit("usage : configure.py install|uninstall")
     install = sys.argv[1] == "install"
     edit_shell(install)
-    edit_cursor(install)
+    edit_cursor(install and WINDOWS)  # hors Windows : on retire seulement les anciens réglages
     if not install and os.path.isdir(CONFIG_DIR):
         shutil.rmtree(CONFIG_DIR)
         print("✓ fond mémorisé supprimé (%s)" % CONFIG_DIR)

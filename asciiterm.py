@@ -83,7 +83,7 @@ class UnixShell:
         if self.pid == 0:
             os.environ.clear()
             os.environ.update(env)
-            shell = env.get("SHELL", "/bin/zsh")
+            shell = env.get("SHELL") or "/bin/sh"  # /bin/zsh manque sur beaucoup de Linux
             os.execvp(shell, [shell, "-i"])
         self.resize(rows, cols)
 
